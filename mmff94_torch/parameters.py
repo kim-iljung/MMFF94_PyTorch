@@ -1,13 +1,13 @@
-"""MMFF94 parameter access backed by the RDKit distribution.
+"""MMFF94 parameter access backed by RDKit or Open Babel installations.
 
 The original version of this project bundled a very small, hand curated
 selection of MMFF94 parameters.  That made the repository easy to understand
 but it limited the type of systems that could be modelled.  The new
-implementation mirrors the canonical parameter set that ships with RDKit by
-parsing the ``MMFF94.ff`` data file that is included in every RDKit
-installation.  A light-weight cache is constructed at import time so that the
-rest of the code base can keep using the simple dictionary based lookups from
-the previous revision.
+implementation mirrors the canonical parameter set that ships with RDKit (and
+is also distributed with Open Babel) by parsing the ``MMFF94.ff`` data file
+from the locally installed chemistry toolkit.  A light-weight cache is
+constructed at import time so that the rest of the code base can keep using the
+simple dictionary based lookups from the previous revision.
 
 Only a subset of the data present in ``MMFF94.ff`` is required by the current
 PyTorch force-field implementation.  The parser therefore focuses on the
@@ -35,6 +35,7 @@ downstream users.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple
@@ -44,11 +45,8 @@ import torch
 
 try:  # pragma: no cover - exercised indirectly through unit tests
     from rdkit import RDConfig
-except ImportError as exc:  # pragma: no cover - executed when RDKit missing
-    raise ImportError(
-        "RDKit is required to load the MMFF94 parameter set. "
-        "Install RDKit before importing 'mmff.parameters'."
-    ) from exc
+except ImportError:  # pragma: no cover - executed when RDKit is missing
+    RDConfig = None
 
 
 # ---------------------------------------------------------------------------
@@ -89,16 +87,41 @@ class TorsionType:
 # File discovery helpers
 
 
-def _find_mmff_parameter_file(mmff_variant: str = "MMFF94") -> Path:
-    """Return the path to the RDKit ``.ff`` file for the given variant."""
+def _candidate_search_roots() -> List[Path]:
+    """Return directories that may contain the ``MMFF94.ff`` file."""
 
-    data_dir = Path(RDConfig.RDDataDir)
+    roots: List[Path] = []
+
+    if RDConfig is not None:
+        roots.append(Path(RDConfig.RDDataDir))
+
+    babel_data = os.environ.get("BABEL_DATADIR")
+    if babel_data:
+        roots.append(Path(babel_data))
+
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if conda_prefix:
+        roots.append(Path(conda_prefix) / "share" / "openbabel")
+
+    return roots
+
+
+def _find_mmff_parameter_file(mmff_variant: str = "MMFF94") -> Path:
+    """Return the path to the chemistry toolkit ``.ff`` file for the variant."""
+
     pattern = f"{mmff_variant.upper()}.ff"
-    for candidate in data_dir.rglob(pattern):
-        if candidate.is_file():
-            return candidate
+    search_roots = _candidate_search_roots()
+
+    for root in search_roots:
+        if not root.exists():
+            continue
+        for candidate in root.rglob(pattern):
+            if candidate.is_file():
+                return candidate
+
+    search_paths = ", ".join(str(root) for root in search_roots)
     raise FileNotFoundError(
-        f"Unable to locate the MMFF parameter file '{pattern}' in {data_dir}."
+        f"Unable to locate the MMFF parameter file '{pattern}'. Searched: {search_paths or 'no known locations'}"
     )
 
 
