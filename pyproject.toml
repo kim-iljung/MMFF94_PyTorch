@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mmff94-pytorch"
+version = "0.1.0"
+description = "PyTorch implementation of the MMFF94 molecular mechanics force field"
+authors = [{name = "OpenAI Assistant"}]
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["torch"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-ra"
+testpaths = ["tests"]

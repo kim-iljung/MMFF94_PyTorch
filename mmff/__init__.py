@@ -1,0 +1,12 @@
+"""MMFF94 implementation using PyTorch.
+
+The package exposes a :class:`MMFFForceField` class that can be used to
+compute molecular mechanics energies with PyTorch tensors.  The module is
+ designed to follow the same spirit as the ``UFF_PyTorch`` project while
+staying lightweight and dependency free.
+"""
+
+from .forcefield import MMFFForceField
+from . import parameters
+
+__all__ = ["MMFFForceField", "parameters"]
