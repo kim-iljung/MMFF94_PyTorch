@@ -8,5 +8,11 @@ staying lightweight and dependency free.
 
 from .forcefield import MMFFForceField
 from . import parameters
+from .builder import build_forcefield, forcefield_from_file
 
-__all__ = ["MMFFForceField", "parameters"]
+__all__ = [
+    "MMFFForceField",
+    "parameters",
+    "build_forcefield",
+    "forcefield_from_file",
+]

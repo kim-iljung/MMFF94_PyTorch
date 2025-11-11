@@ -9,9 +9,5 @@ description = "PyTorch implementation of the MMFF94 molecular mechanics force fi
 authors = [{name = "OpenAI Assistant"}]
 readme = "README.md"
 requires-python = ">=3.9"
-dependencies = ["torch"]
+dependencies = ["torch", "rdkit"]
 
-[tool.pytest.ini_options]
-minversion = "7.0"
-addopts = "-ra"
-testpaths = ["tests"]
