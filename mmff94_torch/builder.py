@@ -258,7 +258,7 @@ def _get_param_masks_and_values(
 
 # ---- Public builder -------------------------------------------------------
 
-def build_from_rdkit_mol(
+def build_mmff_inputs(
     mol: Chem.Mol,
     *,
     include_hs: bool = True,
@@ -328,18 +328,18 @@ def build_from_smiles(
     mol = Chem.MolFromSmiles(smi)
     if mol is None:
         raise ValueError(f"Invalid SMILES: {smi!r}")
-    return build_from_rdkit_mol(mol, include_hs=include_hs, variant=variant, with_params=with_params, drop_missing=drop_missing)
+    return build_mmff_inputs(mol, include_hs=include_hs, variant=variant, with_params=with_params, drop_missing=drop_missing)
 
 
 
 def build_forcefield(mol, *, variant: str = "MMFF94", include_hs: bool = True):
     # 지연 임포트로 순환의존성 회피
-    from .forcefield import build_forcefield as _bf
+    from .model import build_forcefield as _bf
     return _bf(mol, variant=variant, include_hs=include_hs)
 
 
 def forcefield_from_file(path: str, *, variant: str = "MMFF94", include_hs: bool = True):
-    from .forcefield import forcefield_from_file as _fff
+    from .model import forcefield_from_file as _fff
     return _fff(path, variant=variant, include_hs=include_hs)
 
 

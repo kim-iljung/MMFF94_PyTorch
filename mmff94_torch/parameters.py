@@ -6,7 +6,7 @@ Open Babel MMFF94/94s parameter access (RDKit 불필요, RDKit 타입ID도 호�
 - 심볼 기반 테이블 + 숫자 타입ID 기반 테이블을 **동시에** 구축
   (빌더가 '1','2' 같은 RDKit 타입ID를 내보내도 바로 동작)
 
-노출 API (forcefield.py가 기대하는 것):
+노출 API (model.py가 기대하는 것):
   - ATOMIC_PARAMETERS: Dict[str, AtomType]  # 심볼 및 "숫자문자열" 키 모두 지원
   - lookup_bond/angle/torsion((t1, t2[, t3[, t4]]))  # 심볼/숫자 섞여도 OK
   - combine_vdw(atom_a, atom_b)
@@ -17,11 +17,15 @@ from __future__ import annotations
 
 import os
 import math
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
+import numpy as np
 import torch
+from rdkit import Chem
+from rdkit.Chem import AllChem
 
 
 # =============================================================================
@@ -73,6 +77,305 @@ class TorsionType:
     v1: float
     v2: float
     v3: float
+
+
+@dataclass
+class MMFFParams:
+    """Container for MMFF force-field parameters extracted from RDKit."""
+
+    # bonds
+    bonds: np.ndarray
+    kb: np.ndarray
+    r0: np.ndarray
+    # angles
+    angles: np.ndarray
+    ka: np.ndarray
+    theta0_deg: np.ndarray
+    angle_type: np.ndarray
+    # stretch–bend
+    stbn: np.ndarray
+    kba_ijk: np.ndarray
+    kba_kji: np.ndarray
+    sb_r0_ij: np.ndarray
+    sb_r0_kj: np.ndarray
+    sb_theta0_deg: np.ndarray
+    # out-of-plane
+    impropers: np.ndarray
+    koop: np.ndarray
+    # torsions
+    torsions: np.ndarray
+    V1: np.ndarray
+    V2: np.ndarray
+    V3: np.ndarray
+    # nonbonded
+    nb_pairs: np.ndarray
+    is14: np.ndarray
+    Rstar: np.ndarray
+    eps: np.ndarray
+    # charges
+    qi: np.ndarray
+
+
+# =============================================================================
+# RDKit parameter extraction helpers
+# =============================================================================
+
+def _neighbors(mol: Chem.Mol, idx: int) -> List[int]:
+    return [nb.GetIdx() for nb in mol.GetAtomWithIdx(idx).GetNeighbors()]
+
+
+def _enumerate_bonds(mol: Chem.Mol) -> List[Tuple[int, int]]:
+    pairs: List[Tuple[int, int]] = []
+    for bond in mol.GetBonds():
+        i = bond.GetBeginAtomIdx()
+        j = bond.GetEndAtomIdx()
+        if i < j:
+            pairs.append((i, j))
+        else:
+            pairs.append((j, i))
+    return sorted(set(pairs))
+
+
+def _enumerate_angles(mol: Chem.Mol) -> List[Tuple[int, int, int]]:
+    triples: List[Tuple[int, int, int]] = []
+    for j in range(mol.GetNumAtoms()):
+        neighbors = _neighbors(mol, j)
+        for a in range(len(neighbors) - 1):
+            for b in range(a + 1, len(neighbors)):
+                i = neighbors[a]
+                k = neighbors[b]
+                if i < k:
+                    triples.append((i, j, k))
+                else:
+                    triples.append((k, j, i))
+    return triples
+
+
+def _enumerate_torsions(mol: Chem.Mol) -> List[Tuple[int, int, int, int]]:
+    quads: set[Tuple[int, int, int, int]] = set()
+    for bond in mol.GetBonds():
+        j = bond.GetBeginAtomIdx()
+        k = bond.GetEndAtomIdx()
+        j_neighbors = [x for x in _neighbors(mol, j) if x != k]
+        k_neighbors = [x for x in _neighbors(mol, k) if x != j]
+        for i in j_neighbors:
+            for l in k_neighbors:
+                if i == l:
+                    continue
+                jj, kk = (j, k) if j < k else (k, j)
+                ii, ll = (i, l) if j < k else (l, i)
+                quads.add((ii, jj, kk, ll))
+    return sorted(quads)
+
+
+def _enumerate_impropers(mol: Chem.Mol) -> List[Tuple[int, int, int, int]]:
+    quads: List[Tuple[int, int, int, int]] = []
+    for j in range(mol.GetNumAtoms()):
+        neighbors = _neighbors(mol, j)
+        if len(neighbors) < 3:
+            continue
+        for a in range(len(neighbors) - 2):
+            for b in range(a + 1, len(neighbors) - 1):
+                for c in range(b + 1, len(neighbors)):
+                    i = neighbors[a]
+                    k = neighbors[b]
+                    l = neighbors[c]
+                    quads.append((i, j, k, l))
+    return quads
+
+
+def _shortest_path_matrix(mol: Chem.Mol) -> np.ndarray:
+    n_atoms = mol.GetNumAtoms()
+    adjacency: List[List[int]] = [[] for _ in range(n_atoms)]
+    for i, j in _enumerate_bonds(mol):
+        adjacency[i].append(j)
+        adjacency[j].append(i)
+    dist = np.full((n_atoms, n_atoms), np.inf, dtype=float)
+    for source in range(n_atoms):
+        dist[source, source] = 0.0
+        queue: deque[int] = deque([source])
+        seen = {source}
+        while queue:
+            u = queue.popleft()
+            for v in adjacency[u]:
+                if v in seen:
+                    continue
+                dist[source, v] = dist[source, u] + 1.0
+                seen.add(v)
+                queue.append(v)
+    return dist
+
+
+def collect_mmff_params(mol: Chem.Mol, variant: str = "MMFF94") -> MMFFParams:
+    """Collect RDKit MMFF parameters for the supplied molecule."""
+
+    try:
+        props = AllChem.MMFFGetMoleculeProperties(mol, mmffVariant=variant)
+    except Exception:
+        props = AllChem.MMFFGetMoleculeProperties(mol)
+
+    n_atoms = mol.GetNumAtoms()
+    qi = np.array([props.GetMMFFPartialCharge(i) for i in range(n_atoms)], dtype=np.float64)
+
+    bonds = np.array(_enumerate_bonds(mol), dtype=np.int64)
+    kb: List[float] = []
+    r0: List[float] = []
+    bond_idx: Dict[Tuple[int, int], int] = {}
+    for idx, (i, j) in enumerate(bonds.tolist()):
+        params = props.GetMMFFBondStretchParams(mol, i, j)
+        if params is None:
+            kb.append(0.0)
+            r0.append(0.0)
+        else:
+            if len(params) == 3:
+                _, kb_ij, r0_ij = params
+            else:
+                kb_ij, r0_ij = params
+            kb.append(float(kb_ij))
+            r0.append(float(r0_ij))
+        bond_idx[(i, j)] = idx
+    kb_arr = np.asarray(kb, dtype=np.float64)
+    r0_arr = np.asarray(r0, dtype=np.float64)
+
+    angles = np.array(_enumerate_angles(mol), dtype=np.int64)
+    ka: List[float] = []
+    theta0_deg: List[float] = []
+    angle_type: List[int] = []
+    for (i, j, k) in angles.tolist():
+        params = props.GetMMFFAngleBendParams(mol, i, j, k)
+        if params is None:
+            angle_type.append(0)
+            theta0_deg.append(0.0)
+            ka.append(0.0)
+            continue
+        at, x, y = params
+        x_is_angle = isinstance(x, (int, float)) and 30.0 <= float(x) <= 210.0
+        y_is_angle = isinstance(y, (int, float)) and 30.0 <= float(y) <= 210.0
+        if x_is_angle and not y_is_angle:
+            theta0, k_force = float(x), float(y)
+        elif y_is_angle and not x_is_angle:
+            theta0, k_force = float(y), float(x)
+        else:
+            if float(x) >= float(y):
+                theta0, k_force = float(x), float(y)
+            else:
+                theta0, k_force = float(y), float(x)
+        angle_type.append(int(at))
+        theta0_deg.append(theta0)
+        ka.append(k_force)
+    ka_arr = np.asarray(ka, dtype=np.float64)
+    theta0_arr = np.asarray(theta0_deg, dtype=np.float64)
+    angle_type_arr = np.asarray(angle_type, dtype=np.int64)
+
+    stbn: List[Tuple[int, int, int]] = []
+    kba_ijk: List[float] = []
+    kba_kji: List[float] = []
+    sb_r0_ij: List[float] = []
+    sb_r0_kj: List[float] = []
+    sb_theta0: List[float] = []
+    angle_lookup: Dict[Tuple[int, int, int], float] = {
+        tuple(tri): th for tri, th in zip(angles.tolist(), theta0_deg)
+    }
+    angle_lookup.update({(k, j, i): th for (i, j, k), th in angle_lookup.items()})
+    for (i, j, k) in angles.tolist():
+        params = props.GetMMFFStretchBendParams(mol, i, j, k)
+        if params is None:
+            continue
+        _, k1, k2 = params
+        key_ij = (min(i, j), max(i, j))
+        key_kj = (min(k, j), max(k, j))
+        r0_ij = r0_arr[bond_idx[key_ij]] if key_ij in bond_idx else 0.0
+        r0_kj = r0_arr[bond_idx[key_kj]] if key_kj in bond_idx else 0.0
+        stbn.append((i, j, k))
+        kba_ijk.append(float(k1))
+        kba_kji.append(float(k2))
+        sb_r0_ij.append(float(r0_ij))
+        sb_r0_kj.append(float(r0_kj))
+        sb_theta0.append(float(angle_lookup.get((i, j, k), 0.0)))
+    stbn_arr = np.array(stbn, dtype=np.int64) if stbn else np.zeros((0, 3), dtype=np.int64)
+    kba_ijk_arr = np.asarray(kba_ijk, dtype=np.float64)
+    kba_kji_arr = np.asarray(kba_kji, dtype=np.float64)
+    sb_r0_ij_arr = np.asarray(sb_r0_ij, dtype=np.float64)
+    sb_r0_kj_arr = np.asarray(sb_r0_kj, dtype=np.float64)
+    sb_theta0_arr = np.asarray(sb_theta0, dtype=np.float64)
+
+    torsions = np.array(_enumerate_torsions(mol), dtype=np.int64)
+    V1: List[float] = []
+    V2: List[float] = []
+    V3: List[float] = []
+    for (i, j, k, l) in torsions.tolist():
+        params = props.GetMMFFTorsionParams(mol, i, j, k, l)
+        if params is None:
+            V1.append(0.0)
+            V2.append(0.0)
+            V3.append(0.0)
+        else:
+            _, v1, v2, v3 = params
+            V1.append(float(v1))
+            V2.append(float(v2))
+            V3.append(float(v3))
+    V1_arr = np.asarray(V1, dtype=np.float64)
+    V2_arr = np.asarray(V2, dtype=np.float64)
+    V3_arr = np.asarray(V3, dtype=np.float64)
+
+    impropers = np.array(_enumerate_impropers(mol), dtype=np.int64)
+    koop: List[float] = []
+    for (i, j, k, l) in impropers.tolist():
+        params = props.GetMMFFOopBendParams(mol, i, j, k, l)
+        koop.append(0.0 if params is None else float(params))
+    koop_arr = np.asarray(koop, dtype=np.float64)
+
+    dist = _shortest_path_matrix(mol)
+    nb_pairs: List[Tuple[int, int]] = []
+    is14: List[bool] = []
+    Rstar: List[float] = []
+    eps: List[float] = []
+    for i in range(n_atoms):
+        for j in range(i + 1, n_atoms):
+            dij = dist[i, j]
+            if dij < 1.5:
+                continue
+            if dij < 2.5:
+                continue
+            params = props.GetMMFFVdWParams(i, j)
+            if params is None:
+                continue
+            _, _, Rij, eij = params
+            nb_pairs.append((i, j))
+            is14.append(bool(abs(dij - 3.0) < 1e-6))
+            Rstar.append(float(Rij))
+            eps.append(float(eij))
+    nb_pairs_arr = np.array(nb_pairs, dtype=np.int64) if nb_pairs else np.zeros((0, 2), dtype=np.int64)
+    is14_arr = np.asarray(is14, dtype=np.bool_)
+    Rstar_arr = np.asarray(Rstar, dtype=np.float64)
+    eps_arr = np.asarray(eps, dtype=np.float64)
+
+    return MMFFParams(
+        bonds=bonds,
+        kb=kb_arr,
+        r0=r0_arr,
+        angles=angles,
+        ka=ka_arr,
+        theta0_deg=theta0_arr,
+        angle_type=angle_type_arr,
+        stbn=stbn_arr,
+        kba_ijk=kba_ijk_arr,
+        kba_kji=kba_kji_arr,
+        sb_r0_ij=sb_r0_ij_arr,
+        sb_r0_kj=sb_r0_kj_arr,
+        sb_theta0_deg=sb_theta0_arr,
+        impropers=impropers,
+        koop=koop_arr,
+        torsions=torsions,
+        V1=V1_arr,
+        V2=V2_arr,
+        V3=V3_arr,
+        nb_pairs=nb_pairs_arr,
+        is14=is14_arr,
+        Rstar=Rstar_arr,
+        eps=eps_arr,
+        qi=qi,
+    )
 
 
 # =============================================================================
