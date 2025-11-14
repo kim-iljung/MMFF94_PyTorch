@@ -30,63 +30,82 @@ SCALE14_ELEC = 0.75
 
 
 # ------------ Torch geometry helpers ------------
-def _norm(v: torch.Tensor, eps=1e-12): return torch.clamp(torch.linalg.norm(v, dim=-1), min=eps)
+def _ensure_batch(x: torch.Tensor) -> tuple[torch.Tensor, bool]:
+    """Ensure ``x`` has a batch dimension."""
+    if x.dim() == 2:
+        return x.unsqueeze(0), True
+    if x.dim() == 3:
+        return x, False
+    raise ValueError("positions tensor must have shape (N, 3) or (B, N, 3)")
+
+
+def _norm(v: torch.Tensor, eps=1e-12):
+    return torch.clamp(torch.linalg.norm(v, dim=-1), min=eps)
+
 
 def _pair_r(x: torch.Tensor, pairs: torch.Tensor) -> torch.Tensor:
-    if pairs.numel() == 0: return x.new_zeros((0,))
-    return _norm(x[pairs[:,0]] - x[pairs[:,1]])
+    if pairs.numel() == 0:
+        return x.new_zeros((x.shape[0], 0))
+    xi = x[:, pairs[:, 0], :]
+    xj = x[:, pairs[:, 1], :]
+    return _norm(xi - xj)
+
 
 def _angle(x: torch.Tensor, ang: torch.Tensor) -> torch.Tensor:
-    if ang.numel() == 0: return x.new_zeros((0,))
-    i,j,k = ang[:,0], ang[:,1], ang[:,2]
-    v1 = x[i] - x[j]; v2 = x[k] - x[j]
-    c = torch.clamp((v1*v2).sum(-1) / (_norm(v1)*_norm(v2)), -1+1e-12, 1-1e-12)
+    if ang.numel() == 0:
+        return x.new_zeros((x.shape[0], 0))
+    i, j, k = ang[:, 0], ang[:, 1], ang[:, 2]
+    v1 = x[:, i, :] - x[:, j, :]
+    v2 = x[:, k, :] - x[:, j, :]
+    c = torch.clamp((v1 * v2).sum(-1) / (_norm(v1) * _norm(v2)), -1 + 1e-12, 1 - 1e-12)
     return torch.acos(c)  # rad
 
 def _dihedral(x: torch.Tensor, tors: torch.Tensor) -> torch.Tensor:
-    if tors.numel() == 0: return x.new_zeros((0,))
-    i,j,k,l = tors[:,0], tors[:,1], tors[:,2], tors[:,3]
-    r1,r2,r3,r4 = x[i], x[j], x[k], x[l]
+    if tors.numel() == 0:
+        return x.new_zeros((x.shape[0], 0))
+    i, j, k, l = tors[:, 0], tors[:, 1], tors[:, 2], tors[:, 3]
+    r1, r2, r3, r4 = x[:, i, :], x[:, j, :], x[:, k, :], x[:, l, :]
     b0 = r1 - r2
     b1 = r3 - r2
     b2 = r4 - r3
-    b1u = b1 / (torch.linalg.norm(b1, dim=1, keepdim=True) + 1e-15)
-    v = b0 - (b0*b1u).sum(-1, keepdim=True)*b1u
-    w = b2 - (b2*b1u).sum(-1, keepdim=True)*b1u
-    vu = v / (torch.linalg.norm(v, dim=1, keepdim=True) + 1e-15)
-    wu = w / (torch.linalg.norm(w, dim=1, keepdim=True) + 1e-15)
-    xcomp = (vu*wu).sum(-1)
-    ycomp = (torch.cross(b1u, vu, dim=1)*wu).sum(-1)
+    b1u = b1 / (torch.linalg.norm(b1, dim=-1, keepdim=True) + 1e-15)
+    v = b0 - (b0 * b1u).sum(-1, keepdim=True) * b1u
+    w = b2 - (b2 * b1u).sum(-1, keepdim=True) * b1u
+    vu = v / (torch.linalg.norm(v, dim=-1, keepdim=True) + 1e-15)
+    wu = w / (torch.linalg.norm(w, dim=-1, keepdim=True) + 1e-15)
+    xcomp = (vu * wu).sum(-1)
+    ycomp = (torch.cross(b1u, vu, dim=-1) * wu).sum(-1)
     return torch.atan2(ycomp, xcomp)
 
 def _wilson_oop_deg(x: torch.Tensor, imp: torch.Tensor) -> torch.Tensor:
-    if imp.numel() == 0: return x.new_zeros((0,))
-    i,j,k,l = imp[:,0], imp[:,1], imp[:,2], imp[:,3]
-    ri, rj, rk, rl = x[i], x[j], x[k], x[l]
-    n = torch.cross(ri-rj, rk-rj, dim=1)
-    nh = n / (torch.linalg.norm(n, dim=1, keepdim=True) + 1e-15)
+    if imp.numel() == 0:
+        return x.new_zeros((x.shape[0], 0))
+    i, j, k, l = imp[:, 0], imp[:, 1], imp[:, 2], imp[:, 3]
+    ri, rj, rk, rl = x[:, i, :], x[:, j, :], x[:, k, :], x[:, l, :]
+    n = torch.cross(ri - rj, rk - rj, dim=-1)
+    nh = n / (torch.linalg.norm(n, dim=-1, keepdim=True) + 1e-15)
     v = rl - rj
-    vh = v / (torch.linalg.norm(v, dim=1, keepdim=True) + 1e-15)
-    chi = torch.asin(torch.clamp((nh*vh).sum(-1), -1+1e-12, 1-1e-12))
+    vh = v / (torch.linalg.norm(v, dim=-1, keepdim=True) + 1e-15)
+    chi = torch.asin(torch.clamp((nh * vh).sum(-1), -1 + 1e-12, 1 - 1e-12))
     return chi * RAD2DEG
 
 # ------------ Energy kernels (Torch) ------------
 def e_bond(x, pairs, kb, r0):
     if pairs.numel() == 0:
-        return x.new_zeros(())
-    r = _pair_r(x, pairs)          # (Nb,)
-    dr = r - r0                     # r0 is already a tensor buffer
-    t = 1.0 + CS*dr + (7.0/12.0)*(CS**2)*(dr**2)
-    return (FC_BOND * 0.5 * kb * dr*dr * t).sum()
+        return x.new_zeros((x.shape[0],))
+    r = _pair_r(x, pairs)          # (B, Nb)
+    dr = r - r0.unsqueeze(0)       # r0 is already a tensor buffer
+    t = 1.0 + CS * dr + (7.0 / 12.0) * (CS ** 2) * (dr ** 2)
+    return (FC_BOND * 0.5 * kb.unsqueeze(0) * dr * dr * t).sum(dim=1)
 
 def _angle_plain_rad(x: torch.Tensor, ang: torch.Tensor) -> torch.Tensor:
     if ang.numel() == 0:
-        return x.new_zeros((0,))
-    i, j, k = ang[:,0], ang[:,1], ang[:,2]
-    v1 = x[i] - x[j]
-    v2 = x[k] - x[j]
-    n1 = torch.clamp(torch.linalg.norm(v1, dim=1), min=1e-12)
-    n2 = torch.clamp(torch.linalg.norm(v2, dim=1), min=1e-12)
+        return x.new_zeros((x.shape[0], 0))
+    i, j, k = ang[:, 0], ang[:, 1], ang[:, 2]
+    v1 = x[:, i, :] - x[:, j, :]
+    v2 = x[:, k, :] - x[:, j, :]
+    n1 = torch.clamp(torch.linalg.norm(v1, dim=-1), min=1e-12)
+    n2 = torch.clamp(torch.linalg.norm(v2, dim=-1), min=1e-12)
     cosT = torch.clamp((v1 * v2).sum(-1) / (n1 * n2), -1.0 + 1e-12, 1.0 - 1e-12)
     return torch.acos(cosT)  # radians
 
@@ -103,7 +122,7 @@ def e_angle(x: torch.Tensor,
     select it based solely on θ0 as in the reference implementation.
     """
     if ang.numel() == 0:
-        return x.new_zeros(())
+        return x.new_zeros((x.shape[0],))
 
     theta = _angle_plain_rad(x, ang)         # rad
     theta_deg = theta * RAD2DEG
@@ -112,16 +131,21 @@ def e_angle(x: torch.Tensor,
     lin_mask   = (theta0_deg >= LIN_THRESH)
     nonlin_mask = ~lin_mask
 
-    E = x.new_zeros(())
+    E = x.new_zeros((x.shape[0],))
 
     # Linear term: E = 143.9325 * ka * (1 + cos(theta))
     if lin_mask.any():
-        E = E + (143.9325 * ka[lin_mask] * (1.0 + torch.cos(theta[lin_mask]))).sum()
+        th_lin = theta[:, lin_mask]
+        ka_lin = ka[lin_mask]
+        E = E + (143.9325 * ka_lin * (1.0 + torch.cos(th_lin))).sum(dim=1)
 
     # Non-linear term: E = 0.5 * 0.043844 * ka * dθ^2 * (1 + CB * dθ), with dθ in degrees
     if nonlin_mask.any():
-        dth = theta_deg[nonlin_mask] - theta0_deg[nonlin_mask]
-        E = E + (0.5 * FC_ANGLE * ka[nonlin_mask] * dth * dth * (1.0 + CB * dth)).sum()
+        th_nonlin = theta_deg[:, nonlin_mask]
+        theta0_nonlin = theta0_deg[nonlin_mask]
+        ka_nonlin = ka[nonlin_mask]
+        dth = th_nonlin - theta0_nonlin
+        E = E + (0.5 * FC_ANGLE * ka_nonlin * dth * dth * (1.0 + CB * dth)).sum(dim=1)
 
     return E
 
@@ -129,50 +153,57 @@ def e_angle(x: torch.Tensor,
 
 def e_stretch_bend(x, stbn, kba_ijk, kba_kji, sb_r0_ij, sb_r0_kj, sb_theta0_deg):
     if stbn.numel() == 0:
-        return x.new_zeros(())
+        return x.new_zeros((x.shape[0],))
     i, j, k = stbn[:,0], stbn[:,1], stbn[:,2]
     rij = _pair_r(x, torch.stack([i, j], dim=1))
     rkj = _pair_r(x, torch.stack([k, j], dim=1))
-    Drij = rij - sb_r0_ij
-    Drkj = rkj - sb_r0_kj
+    Drij = rij - sb_r0_ij.unsqueeze(0)
+    Drkj = rkj - sb_r0_kj.unsqueeze(0)
     th_deg = _angle(x, stbn) * RAD2DEG
-    DT = th_deg - sb_theta0_deg
+    DT = th_deg - sb_theta0_deg.unsqueeze(0)
     # E_SB = 2.51210 * (kba_ijk * Δr_ij + kba_kji * Δr_kj) * Δθ
-    return (FC_STBN * (kba_ijk * Drij + kba_kji * Drkj) * DT).sum()
+    return (FC_STBN * (kba_ijk.unsqueeze(0) * Drij + kba_kji.unsqueeze(0) * Drkj) * DT).sum(dim=1)
 
 
 def e_oop(x, imp, koop):
-    if imp.numel()==0: return x.new_zeros(())
+    if imp.numel()==0:
+        return x.new_zeros((x.shape[0],))
     chi = _wilson_oop_deg(x, imp)
-    return (0.5 * FC_ANGLE * koop * chi * chi).sum()
+    return (0.5 * FC_ANGLE * koop.unsqueeze(0) * chi * chi).sum(dim=1)
 
 def e_tors(x, tors, V1, V2, V3):
-    if tors.numel()==0: return x.new_zeros(())
+    if tors.numel()==0: return x.new_zeros((x.shape[0],))
     w = _dihedral(x, tors)
-    return (0.5*(V1*(1.0+torch.cos(w)) + V2*(1.0 - torch.cos(2*w)) + V3*(1.0 + torch.cos(3*w)))).sum()
+    term = (0.5 * (V1.unsqueeze(0) * (1.0+torch.cos(w)) +
+                   V2.unsqueeze(0) * (1.0 - torch.cos(2*w)) +
+                   V3.unsqueeze(0) * (1.0 + torch.cos(3*w))))
+    return term.sum(dim=1)
 
 def e_vdw(x, pairs, Rstar, eps, is14, scale14_vdw: float = 1.0):
-    if pairs.numel()==0: return x.new_zeros(())
+    if pairs.numel()==0: return x.new_zeros((x.shape[0],))
     r = _pair_r(x, pairs)
-    R = Rstar
+    R = Rstar.unsqueeze(0)
     t1 = ((1.07*R) / (r + 0.07*R)) ** 7
     R7 = R ** 7
     t2 = (1.12*R7) / (r**7 + 0.12*R7) - 2.0
-    e = eps * t1 * t2
+    e = eps.unsqueeze(0) * t1 * t2
     if scale14_vdw != 1.0:
-        scale = torch.where(is14, torch.tensor(scale14_vdw, dtype=e.dtype, device=e.device),
-                            torch.tensor(1.0, dtype=e.dtype, device=e.device))
+        scale = torch.ones_like(e)
+        scale[:, is14] = scale14_vdw
         e = e * scale
-    return e.sum()
+    return e.sum(dim=1)
 
 def e_elec(x, pairs, qi, is14, dielectric: float = 1.0, scale14_elec: float = SCALE14_ELEC):
-    if pairs.numel()==0: return x.new_zeros(())
+    if pairs.numel()==0: return x.new_zeros((x.shape[0],))
     r = _pair_r(x, pairs)
     qij = qi[pairs[:,0]] * qi[pairs[:,1]]
-    base = KE * qij / (dielectric * (r + COUL_BUF))
-    scale = torch.where(is14, torch.tensor(scale14_elec, dtype=base.dtype, device=base.device),
-                        torch.tensor(1.0, dtype=base.dtype, device=base.device))
-    return (scale * base).sum()
+    base = KE * qij.unsqueeze(0) / (dielectric * (r + COUL_BUF))
+    if scale14_elec != 1.0 or is14.any():
+        scale = torch.ones_like(base)
+        scale[:, is14] = scale14_elec
+    else:
+        scale = 1.0
+    return (scale * base).sum(dim=1)
 
 # ------------ Main module ------------
 class MMFFTorch(nn.Module):
@@ -222,7 +253,7 @@ class MMFFTorch(nn.Module):
         return self.energy(positions)
 
     def energy(self, positions: torch.Tensor) -> torch.Tensor:
-        x = positions
+        x, squeezed = _ensure_batch(positions)
         E  = e_bond(x, self.bonds, self.kb, self.r0)
         E += e_angle(x, self.angles, self.ka, self.theta0_deg, self.angle_type)
         E += e_stretch_bend(x, self.stbn, self.kba_ijk, self.kba_kji,
@@ -233,12 +264,15 @@ class MMFFTorch(nn.Module):
             E += e_vdw(x, self.nb_pairs, self.Rstar, self.eps, self.is14, self.scale14_vdw)
         if self.enable_coulomb:
             E += e_elec(x, self.nb_pairs, self.qi, self.is14, dielectric=self.dielectric)
-        return E
+        return E.squeeze(0) if squeezed else E
 
     def forces(self, positions: torch.Tensor) -> torch.Tensor:
         positions = positions.requires_grad_(True)
         E = self.energy(positions)
-        (grad,) = torch.autograd.grad(E, positions, create_graph=False)
+        if E.dim() == 0:
+            grad, = torch.autograd.grad(E, positions, create_graph=False)
+        else:
+            grad, = torch.autograd.grad(E.sum(), positions, create_graph=False)
         return -grad
 
 def build_forcefield(mol: Chem.Mol, **kwargs) -> MMFFTorch:
